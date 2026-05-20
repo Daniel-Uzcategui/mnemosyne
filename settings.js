@@ -58,6 +58,13 @@ function defaultSettings() {
       hashChunkSize: 64 * 1024,
       hashYieldInterval: 8,
       largeInputCooperativeThreshold: 256 * 1024,
+      subagentModel: 'fast',
+      subagentPromptPatterns: [
+        'managed memory extraction subagent',
+        'you are now acting as',
+        'specialist agent',
+        'read-only exploration task',
+      ],
     },
   };
 }

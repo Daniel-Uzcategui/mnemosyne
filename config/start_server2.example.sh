@@ -23,11 +23,12 @@ llama-server --models-preset "$MODELS_PRESET" \
   -b 2048 \
   -ub 2048 \
   -sm layer \
-  --cache-type-k turbo4 \
-  --cache-type-v turbo4 \
+  --cache-type-k q4_0 \
+  --cache-type-v q4_0 \
   -fa 1 \
   -np 1 \
   --metrics \
+  --no-context-shift \
   --no-mmap \
   --slot-save-path "$SLOT_SAVE_PATH" \
   --reasoning on \

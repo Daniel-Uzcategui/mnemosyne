@@ -100,6 +100,8 @@ Main sections:
 
 The example config defines two backends on ports `11434` and `11435` and is the best starting point for a multi-GPU setup.
 
+When KV persistence is enabled, backend workers should be started with `--no-context-shift`. KVBridge reuses serialized slot snapshots by exact prompt-prefix identity; if a backend silently shifts or truncates its in-memory context and that mutated state is saved under the original hash, future restores will be corrupted.
+
 ## HTTP Surface
 
 ### User and Dashboard Endpoints
@@ -139,6 +141,7 @@ Routing behavior for chat completions:
 - Request summaries are serialized into `ghost_detector.txt` to avoid interleaved writes under load.
 - `start.sh` relaunches KVBridge under `nohup` and writes the main process output to `app.log`.
 - The dashboard expects `/api/stats` and will reflect aggregated llama metrics when worker backends expose `/metrics`.
+- Requests that overflow backend context are forwarded as client-facing errors and are never persisted to the KV cache. Responses that end with `finish_reason = length` are also treated conservatively and skip cache save.
 
 ## Example Flow
 

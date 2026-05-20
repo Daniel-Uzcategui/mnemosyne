@@ -314,6 +314,11 @@
       background: linear-gradient(90deg, var(--accent), #60a5fa);
     }
 
+    .progress.indeterminate > span {
+      width: 38%;
+      animation: stagePulse 1.2s linear infinite;
+    }
+
     .stage-list {
       display: grid;
       gap: 8px;
@@ -677,6 +682,12 @@
   <div id="tab-settings" class="tab-content">
     <div class="form-section">
       <h3>🔧 Server Configuration</h3>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Server Binding Port</label>
+          <input id="cfg-server-port" name="server-port" type="number" />
+        </div>
+      </div>
       <div class="form-actions">
         <button id="save-settings-btn">Save Settings</button>
         <button id="reload-settings-btn">Reload Settings</button>
@@ -834,7 +845,7 @@
       const phase = activity?.phase || 'idle';
       const prefillProgress = activity?.progress === null || activity?.progress === undefined
         ? null
-        : Math.max(0, Math.min(activity.progress * 100, 100));
+        : Math.max(0, Math.min(activity.progress, 100));
       const hasDeterminatePrefill = prefillProgress !== null && prefillProgress > 0 && prefillProgress < 100;
 
       const laterThanRestore = ['restored', 'partial-restored', 'prefill', 'awaiting-output', 'generating', 'streaming', 'saving-cache', 'finishing', 'idle', 'busy', 'canceled'].includes(phase);
@@ -950,7 +961,7 @@
           : (activity.phase === 'restoring' || activity.phase === 'saving-cache' ? 'warn' : (activity.phase === 'generating' ? '' : (activity.phase === 'idle' ? '' : '')));
         const progressPct = activity.progress === null || activity.progress === undefined
           ? null
-          : Math.max(0, Math.min(activity.progress * 100, 100));
+          : Math.max(0, Math.min(activity.progress, 100));
         const showProgressBar = progressPct !== null && progressPct > 0 && progressPct < 100;
         const elapsedText = activity.startedAt ? formatDuration(Date.now() - activity.startedAt) : null;
         const requestText = activity.requestId ? `req ${activity.requestId}` : null;
@@ -1098,10 +1109,13 @@
     function renderSlots(slots) {
       const html = slots.map(slot => {
         const busy = slot.activeReq !== null;
+        const phase = slot.phase || 'idle';
         const progressPct = slot.progress === null || slot.progress === undefined
           ? null
-          : Math.max(0, Math.min(slot.progress * 100, 100));
-        const showProgressBar = progressPct !== null && progressPct > 0 && progressPct < 100;
+          : Math.max(0, Math.min(slot.progress, 100));
+        const isDeterminate = progressPct !== null && progressPct > 0 && progressPct < 100;
+        const showIndeterminateBar = !isDeterminate && ['restoring', 'awaiting-output', 'saving-cache'].includes(phase);
+        const showProgressBar = isDeterminate || showIndeterminateBar;
         return `
           <article class="slot-card ${busy ? 'busy' : 'idle'}">
             <div class="slot-head">
@@ -1122,8 +1136,11 @@
             ${busy ? `<div><div class="meta-label">ReqID</div><div class="meta-value mono">${slot.activeReq}</div></div>` : ''}
             ${Number.isInteger(slot.taskId) ? `<div><div class="meta-label">Task ID</div><div class="meta-value mono">${slot.taskId}</div></div>` : ''}
             ${slot.phase ? `<div><div class="meta-label">Phase</div><div class="meta-value mono">${slot.phase}</div></div>` : ''}
+            ${slot.summary ? `<div><div class="meta-label">Summary</div><div class="meta-value mono">${slot.summary}</div></div>` : ''}
             ${slot.detail ? `<div><div class="meta-label">Detail</div><div class="meta-value mono">${slot.detail}</div></div>` : ''}
-            ${showProgressBar ? `<div class="progress"><span style="width:${progressPct}%"></span></div>` : ''}
+            ${showProgressBar
+              ? `<div class="progress ${showIndeterminateBar ? 'indeterminate' : ''}"><span style="${isDeterminate ? `width:${progressPct}%` : ''}"></span></div>`
+              : ''}
           </article>
         `;
       }).join('');
@@ -1224,6 +1241,18 @@
         const res = await fetch('/api/stats');
         const data = await res.json();
 
+        // Normalize raw progress floats to 0-100 percentage
+        (data.backends || []).forEach(b => {
+          if (b.activity && typeof b.activity.progress === 'number') {
+            b.activity.progress = b.activity.progress * 100;
+          }
+        });
+        (data.slots || []).forEach(s => {
+          if (typeof s.progress === 'number') {
+            s.progress = s.progress * 100;
+          }
+        });
+
         document.getElementById('last-refresh').innerText = `Last refresh ${new Date().toLocaleTimeString()}`;
 
         document.getElementById('queue-val').innerText = data.queueLength;
@@ -1235,28 +1264,25 @@
           document.getElementById('queue-val').style.color = 'var(--text)';
         }
 
-        const maxCtx = 262144;
+        const maxCtx = Math.max(1, ...(data.models || [])
+          .map(model => model?.meta?.n_ctx || model?.meta?.n_ctx_train || 0)
+          .filter(value => Number.isFinite(value) && value > 0));
         const maxTokens = data.llamaMetrics?.['llamacpp:n_tokens_max'] || 0;
         const maxPct = Math.min((maxTokens / maxCtx) * 100, 100);
-        document.getElementById('vram-val').innerText = maxTokens;
+        document.getElementById('vram-val').innerText = `${maxTokens} / ${maxCtx}`;
         document.getElementById('vram-bar').style.width = `${maxPct}%`;
 
-        const l1Gb = (data.l1UsageBytes / (1024 * 1024 * 1024)).toFixed(2);
-        const l1Pct = Math.min((l1Gb / 2.5) * 100, 100);
-        document.getElementById('l1-val').innerText = `${l1Gb} GB / 2.5 GB`;
+        const l1ThresholdBytes = data.l1EvictThresholdBytes || (2.5 * 1024 * 1024 * 1024);
+        const l1Gb = (data.l1UsageBytes || 0) / (1024 * 1024 * 1024);
+        const l1ThresholdGb = l1ThresholdBytes / (1024 * 1024 * 1024);
+        const l1Pct = Math.min((l1Gb / l1ThresholdGb) * 100, 100);
+        document.getElementById('l1-val').innerText = `${l1Gb.toFixed(2)} GB / ${l1ThresholdGb.toFixed(2)} GB`;
         document.getElementById('l1-bar').style.width = `${l1Pct}%`;
         document.getElementById('l1-bar').style.background = l1Pct > 90 ? 'linear-gradient(90deg, #ef4444, #f97316)' : 'linear-gradient(90deg, var(--accent), #60a5fa)';
 
-        const predictedTotal = data.llamaMetrics?.['llamacpp:tokens_predicted_total'] || 0;
-        const predictedSeconds = data.llamaMetrics?.['llamacpp:tokens_predicted_seconds_total'] || 0;
-        const promptTotal = data.llamaMetrics?.['llamacpp:prompt_tokens_total'] || 0;
-        const promptSeconds = data.llamaMetrics?.['llamacpp:prompt_seconds_total'] || 0;
-        const generationRate = predictedSeconds > 0 ? (predictedTotal / predictedSeconds) : 0;
-        const promptRate = promptSeconds > 0 ? (promptTotal / promptSeconds) : 0;
-
-        document.getElementById('tokens-pred').innerText = predictedTotal;
-        document.getElementById('tokens-eval').innerText = generationRate.toFixed(1);
-        document.getElementById('reqs-proc').innerText = promptRate.toFixed(1);
+        document.getElementById('tokens-pred').innerText = data.llamaMetrics?.['llamacpp:tokens_predicted_total'] || 0;
+        document.getElementById('tokens-eval').innerText = (data.llamaMetrics?.['llamacpp:predicted_tokens_seconds'] || 0).toFixed(1);
+        document.getElementById('reqs-proc').innerText = (data.llamaMetrics?.['llamacpp:prompt_tokens_seconds'] || 0).toFixed(1);
         document.getElementById('cache-index-val').innerText = data.models?.length || 0;
         const topModel = (data.models || [])[0];
         document.getElementById('cache-index-sub').innerText = topModel
@@ -1269,7 +1295,10 @@
         renderSlots(data.slots || []);
         renderCacheEntries(data.cache?.topEntries || []);
 
-        if (!selectedBackendId && data.backends?.length) {
+        // Continuously refresh the currently open log view frame automatically
+        if (selectedBackendId) {
+          await loadLogs(selectedBackendId);
+        } else if (data.backends?.length) {
           await loadLogs(data.backends[0].id);
         }
       } catch (error) {
@@ -1313,6 +1342,7 @@
     }
 
     function populateSettingsForm(s) {
+      document.getElementById('cfg-server-port').value = s.server?.port || 8080;
       document.getElementById('cfg-models-dir').value = s.storage.modelsDir || '';
       document.getElementById('cfg-l1-dir').value = s.storage.l1Dir || '';
       document.getElementById('cfg-l2-dir').value = s.storage.l2Dir || '';

@@ -53,6 +53,13 @@
     "ragContentLengthThreshold": 1000,
     "hashChunkSize": 65536,
     "hashYieldInterval": 8,
-    "largeInputCooperativeThreshold": 262144
+    "largeInputCooperativeThreshold": 262144,
+    "subagentModel": "fast",
+    "subagentPromptPatterns": [
+      "managed memory extraction subagent",
+      "you are now acting as",
+      "specialist agent",
+      "read-only exploration task"
+    ]
   }
 }

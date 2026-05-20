@@ -21,7 +21,7 @@ const fastify = require('fastify');
 const fastifyCors = require('@fastify/cors');
 const fastifyFormBody = require('@fastify/formbody');
 
-const { copyFile, rm, readdir, stat, mkdir, appendFile, readFile } = require('fs/promises');
+const { copyFile, rm, readdir, stat, mkdir, appendFile, readFile, open } = require('fs/promises');
 const { existsSync, createWriteStream } = require('fs');
 const { join, extname } = require('path');
 
@@ -37,6 +37,7 @@ let BACKEND_CONFIGS, BACKEND_AUTO_START, BACKEND_STARTUP_GRACE_MS;
 let L1_EVICT_THRESHOLD, L1_EVICT_TARGET;
 let GARBAGE_COLLECT_INTERVAL_MS, MAX_FILE_AGE_MS;
 let RAG_CONTENT_LENGTH_THRESHOLD, WARMUP_TOP_N;
+let SUBAGENT_MODEL, SUBAGENT_PROMPT_PATTERNS;
 
 async function initSettings() {
   await loadSettings();
@@ -69,6 +70,13 @@ async function initSettings() {
 
   RAG_CONTENT_LENGTH_THRESHOLD = s.misc.ragContentLengthThreshold;
   WARMUP_TOP_N = s.misc.warmupTopN;
+  SUBAGENT_MODEL = normalizeModelId(s.misc.subagentModel) || 'fast';
+  SUBAGENT_PROMPT_PATTERNS = Array.isArray(s.misc.subagentPromptPatterns)
+    ? s.misc.subagentPromptPatterns
+        .filter(pattern => typeof pattern === 'string')
+        .map(pattern => pattern.trim().toLowerCase())
+        .filter(Boolean)
+    : [];
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -196,6 +204,11 @@ function createBackendState(config) {
     modelsDiscoveryError: null,
     lastMetrics: {},
     lastMetricsAt: 0,
+    failureStreak: 0,
+    degradedUntil: 0,
+    requestFailures: 0,
+    restoreFailures: 0,
+    lastFailureKind: null,
     processInfo: {
       status: 'stopped',
       pid: null,
@@ -215,11 +228,22 @@ let roundRobinCounter = 0;
 const MODEL_OPERATION_TIMEOUT_MS = 90_000;
 const MODEL_OPERATION_POLL_INTERVAL_MS = 1_000;
 const backendModelOperationLocks = new Map();
+const BACKEND_FAILURE_COOLDOWN_MS = 60_000;
+const BACKEND_FAILURE_MAX_COOLDOWN_MS = 5 * 60_000;
 
 function normalizeModelId(model) {
   if (typeof model !== 'string') return null;
   const value = model.trim();
   return value.length > 0 ? value : null;
+}
+
+function isSubagentPrompt(systemPrompt = '') {
+  const normalized = normalizeText(systemPrompt);
+  if (!normalized || SUBAGENT_PROMPT_PATTERNS.length === 0) {
+    return false;
+  }
+
+  return SUBAGENT_PROMPT_PATTERNS.some(pattern => normalized.includes(pattern));
 }
 
 function createDiscoveredModelEntry(modelId, patch = {}) {
@@ -263,8 +287,52 @@ function getBackendsForModel(modelId) {
   return backends.filter(backend => backend.discoveredModels.has(normalizedModelId));
 }
 
+function isBackendDegraded(backend, now = Date.now()) {
+  return Number.isFinite(backend.degradedUntil) && backend.degradedUntil > now;
+}
+
+function isBackendRoutable(backend, now = Date.now()) {
+  return backend.healthy && !isBackendDegraded(backend, now);
+}
+
+function clearBackendDegradedState(backend) {
+  backend.failureStreak = 0;
+  backend.degradedUntil = 0;
+  backend.lastFailureKind = null;
+}
+
+function markBackendRequestFailure(backend, kind, error = null) {
+  backend.failureStreak = (backend.failureStreak || 0) + 1;
+  backend.lastFailureKind = kind;
+
+  if (kind === 'restore') {
+    backend.restoreFailures = (backend.restoreFailures || 0) + 1;
+  } else {
+    backend.requestFailures = (backend.requestFailures || 0) + 1;
+  }
+
+  const cooldownMs = Math.min(
+    BACKEND_FAILURE_COOLDOWN_MS * backend.failureStreak,
+    BACKEND_FAILURE_MAX_COOLDOWN_MS
+  );
+
+  backend.degradedUntil = Date.now() + cooldownMs;
+  backend.lastError = error?.message || kind;
+  invalidateAffinityForBackend(backend.id);
+
+  logWarn(
+    `Backend degraded: ${backend.id} kind=${kind} cooldown=${Math.round(cooldownMs / 1000)}s`
+      + (error?.message ? ` (${error.message})` : '')
+  );
+}
+
+function markBackendRequestSuccess(backend) {
+  clearBackendDegradedState(backend);
+  backend.lastError = null;
+}
+
 function getHealthyBackendsForModel(modelId) {
-  return getBackendsForModel(modelId).filter(backend => backend.healthy);
+  return getBackendsForModel(modelId).filter(backend => isBackendRoutable(backend));
 }
 
 function buildAggregatedModelRegistry() {
@@ -289,6 +357,7 @@ function buildAggregatedModelRegistry() {
         id: backend.id,
         url: backend.baseUrl,
         healthy: backend.healthy,
+        routable: isBackendRoutable(backend),
         discoveredAt: backend.modelsDiscoveryAt,
         discoveryError: backend.modelsDiscoveryError,
         status: model.backendStatus,
@@ -298,7 +367,7 @@ function buildAggregatedModelRegistry() {
   }
 
   for (const entry of registry.values()) {
-    entry.healthyBackends = entry.backends.filter(backend => backend.healthy);
+    entry.healthyBackends = entry.backends.filter(backend => backend.routable);
     entry.loadedBackends = entry.backends.filter(backend => {
       const value = backend.status?.value;
       return value === 'loaded' || value === 'loading' || value === 'sleeping';
@@ -652,6 +721,84 @@ async function tailFile(path, lineCount = 120) {
   return content.split('\n').slice(-lineCount).join('\n').trim();
 }
 
+async function readTailBytes(path, maxBytes = 128 * 1024) {
+  if (!existsSync(path)) return '';
+
+  const fileStats = await safeStat(path);
+  if (!fileStats || fileStats.size <= 0) return '';
+
+  const start = Math.max(0, fileStats.size - maxBytes);
+  const length = fileStats.size - start;
+  const handle = await open(path, 'r');
+
+  try {
+    const buffer = Buffer.alloc(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, start);
+    return buffer.toString('utf8', 0, bytesRead);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function refreshBackendPrefillProgress(backend) {
+  const activePrefillSlots = [...backend.slotActivity.entries()].filter(([, activity]) => (
+    activity && ['prefill', 'prompt'].includes(activity.phase)
+  ));
+
+  if (activePrefillSlots.length === 0) {
+    return;
+  }
+
+  const logTail = await readTailBytes(backend.processInfo.logPath);
+  if (!logTail) {
+    return;
+  }
+
+  const latestProgressBySlot = new Map();
+  const progressPattern = /slot update_slots: id\s+(\d+)\s+\|\s+task\s+(\d+)\s+\|\s+prompt processing progress,.*?\bprogress\s*=\s*([0-9]*\.?[0-9]+)/;
+
+  for (const line of logTail.split('\n')) {
+    const match = line.match(progressPattern);
+    if (!match) {
+      continue;
+    }
+
+    const slotId = Number.parseInt(match[1], 10);
+    const taskId = Number.parseInt(match[2], 10);
+    const progress = Number.parseFloat(match[3]);
+    if (!Number.isInteger(slotId) || !Number.isInteger(taskId) || !Number.isFinite(progress)) {
+      continue;
+    }
+
+    latestProgressBySlot.set(slotId, {
+      taskId,
+      progress: Math.max(0, Math.min(progress, 1)),
+    });
+  }
+
+  for (const [slotId, activity] of activePrefillSlots) {
+    const parsed = latestProgressBySlot.get(slotId);
+    if (!parsed) {
+      continue;
+    }
+
+    if (Number.isInteger(activity.taskId) && activity.taskId !== parsed.taskId) {
+      continue;
+    }
+
+    const currentProgress = Number.isFinite(activity.progress) ? activity.progress : 0;
+    if (parsed.progress < currentProgress) {
+      continue;
+    }
+
+    updateSlotActivity(backend, slotId, {
+      taskId: parsed.taskId,
+      progress: parsed.progress,
+      detail: `Processing prompt (${Math.round(parsed.progress * 100)}%).`,
+    });
+  }
+}
+
 async function ensureBackendLogFile(backend) {
   if (!existsSync(BACKEND_LOG_DIR)) {
     await mkdir(BACKEND_LOG_DIR, { recursive: true });
@@ -755,7 +902,11 @@ async function ensureBackendProcess(backend, trigger = 'auto') {
 
   let lock = backendStartupLocks.get(backend.id);
   if (lock) {
-    await lock;
+    try {
+      await lock;
+    } catch (err) {
+      // Sibling thread failed to start, ignore the error and check state
+    }
     if (isBackendProcessActive(backend)) return;
   }
 
@@ -765,9 +916,18 @@ async function ensureBackendProcess(backend, trigger = 'auto') {
   }
 
   // Acquire lock to prevent concurrent spawns
-  backendStartupLocks.set(backend.id, () => {});
+  let resolveLock, rejectLock;
+  const promiseLock = new Promise((resolve, reject) => {
+    resolveLock = resolve;
+    rejectLock = reject;
+  });
+  backendStartupLocks.set(backend.id, promiseLock);
   try {
     await startBackendProcess(backend, trigger);
+    resolveLock();
+  } catch (err) {
+    if (rejectLock) rejectLock(err);
+    throw err;
   } finally {
     backendStartupLocks.delete(backend.id);
   }
@@ -784,7 +944,7 @@ async function bootstrapBackendProcesses() {
 }
 
 function getHealthyBackends() {
-  return backends.filter(backend => backend.healthy);
+  return backends.filter(backend => isBackendRoutable(backend));
 }
 
 function getTotalQueueLength() {
@@ -906,6 +1066,9 @@ async function checkBackendHealth(backend) {
           await refreshBackendModels(backend);
         } catch (err) {
           logWarn(`Model discovery failed for ${backend.id}: ${err.message}`);
+        }
+        if (backend.failureStreak > 0 && !isBackendDegraded(backend)) {
+          clearBackendDegradedState(backend);
         }
         backend.lastError = null;
         backend.lastCheckAt = Date.now();
@@ -1173,6 +1336,27 @@ function upsertAffinity(requestContext, backendId, slotId) {
   }
 }
 
+function clearSlotContext(backend, slotId) {
+  if (!Number.isInteger(slotId) || slotId < 0 || slotId >= backend.maxSlots) {
+    return;
+  }
+
+  const previous = backend.slotContextIndex.get(slotId);
+  if (!previous) {
+    return;
+  }
+
+  backend.slotContextIndex.delete(slotId);
+
+  for (const map of [affinityIndex.exact, affinityIndex.system, affinityIndex.prefix]) {
+    for (const [key, value] of map.entries()) {
+      if (value.backendId === backend.id && value.slotId === slotId) {
+        map.delete(key);
+      }
+    }
+  }
+}
+
 function rememberSlotContext(backend, slotId, requestContext, source) {
   if (slotId === null || slotId === undefined) return;
 
@@ -1193,6 +1377,7 @@ const inFlightMisses = new Map();
 // ─── Active cache file tracking — prevents GC from deleting files in use ─
 
 const activeCacheFiles = new Set();  // Set of hashes currently being accessed
+const inFlightDiskCopies = new Map(); // hash -> Promise (prevents concurrent identical L1 to L2 saves and GC evictions)
 
 function markCacheActive(hash) {
   activeCacheFiles.add(hash);
@@ -1209,12 +1394,12 @@ async function sweepL1Eviction() {
     const files = await safeReaddir(L1_DIR);
     const binFiles = files.filter(f => extname(f) === '.bin');
 
-    // Calculate total L1 size — skip files currently in use
+    // Calculate total L1 size — skip files currently in use or copying
     let totalSize = 0;
     const fileInfo = [];
     for (const f of binFiles) {
       const hash = f.replace(/\.bin$/, '');
-      if (activeCacheFiles.has(hash)) continue;
+      if (activeCacheFiles.has(hash) || inFlightDiskCopies.has(hash)) continue;
 
       const s = await safeStat(join(L1_DIR, f));
       if (s) {
@@ -1236,8 +1421,8 @@ async function sweepL1Eviction() {
     let freed = 0;
     for (const fi of fileInfo) {
       if (totalSize <= L1_EVICT_TARGET) break;
-      // Race guard: skip if file became active since we scanned
-      if (activeCacheFiles.has(fi.hash)) continue;
+      // Race guard: skip if file became active or started copying since we scanned
+      if (activeCacheFiles.has(fi.hash) || inFlightDiskCopies.has(fi.hash)) continue;
       const fpath = join(L1_DIR, fi.name);
       await rm(fpath, { force: true });  // atomic: no-op if file gone
       evicted++;
@@ -1263,8 +1448,8 @@ async function gcSweep() {
 
     for (const f of binFiles) {
       const hash = f.replace(/\.bin$/, '');
-      // Skip files currently in use by a route handler
-      if (activeCacheFiles.has(hash)) continue;
+      // Skip files currently in use by a route handler or actively copying
+      if (activeCacheFiles.has(hash) || inFlightDiskCopies.has(hash)) continue;
 
       const s = await safeStat(join(L1_DIR, f));
       if (s && now - s.mtimeMs > MAX_FILE_AGE_MS) {
@@ -1402,6 +1587,7 @@ async function restoreKVCache(hash, model, backend, slotId) {
     log('RESTORE', `${C.green}Success${C.reset}  →  ${filename}  (backend=${backend.id} slot=${slotId}, ${res.status})`);
     return true;
   } catch (err) {
+    markBackendRequestFailure(backend, 'restore', err);
     logErr(`Restore failed for ${hash}.bin (backend=${backend.id} slot=${slotId}): ${err.message}`);
     throw err;
   }
@@ -1507,7 +1693,53 @@ const observedLlamaMetrics = {
   'llamacpp:tokens_predicted_seconds_total': 0,
   'llamacpp:prompt_tokens_seconds': 0,
   'llamacpp:predicted_tokens_seconds': 0,
+  'kvbridge:context_overflow_total': 0,
+  'kvbridge:cache_save_skipped_total': 0,
 };
+
+function extractErrorMessage(payload) {
+  if (!payload) return '';
+  if (typeof payload === 'string') return payload;
+  if (typeof payload?.error?.message === 'string') return payload.error.message;
+  if (typeof payload?.message === 'string') return payload.message;
+  return '';
+}
+
+function isContextOverflowMessage(message) {
+  return /exceeds the available context size|context size|context length|n_ctx|prompt is too long|too large for the context|too many tokens/i.test(message || '');
+}
+
+function classifyContextOverflow(payload, statusCode = null) {
+  const message = extractErrorMessage(payload).trim();
+  const overflow = isContextOverflowMessage(message)
+    || (Number(statusCode) === 400 && isContextOverflowMessage(JSON.stringify(payload || {})));
+
+  return {
+    overflow,
+    message,
+  };
+}
+
+function payloadHasLengthFinishReason(payload) {
+  const choices = Array.isArray(payload?.choices) ? payload.choices : [];
+  return choices.some(choice => choice?.finish_reason === 'length');
+}
+
+function markContextOverflow(cacheHash, source, detail = '', skippedSave = false) {
+  observedLlamaMetrics['kvbridge:context_overflow_total'] += 1;
+  if (skippedSave) {
+    observedLlamaMetrics['kvbridge:cache_save_skipped_total'] += 1;
+  }
+  const hashLabel = cacheHash ? cacheHash.slice(0, 8) : 'no-hash';
+  const message = detail ? `source=${source} hash=${hashLabel} detail=${detail}` : `source=${source} hash=${hashLabel}`;
+  logWarn(`Context overflow detected; cache save skipped (${message})`);
+}
+
+function markCacheSaveSkipped(reason, cacheHash) {
+  observedLlamaMetrics['kvbridge:cache_save_skipped_total'] += 1;
+  const hashLabel = cacheHash ? cacheHash.slice(0, 8) : 'no-hash';
+  logWarn(`Cache save skipped (${reason}) for hash=${hashLabel}`);
+}
 
 function normalizePositiveNumber(value) {
   const numericValue = Number(value);
@@ -1590,8 +1822,10 @@ function extractRequestContext(body) {
     }
   }
 
-  const model = body?.model || null;
+  const requestedModel = normalizeModelId(body?.model);
   const normalizedSystemPrompt = normalizeText(systemPrompt);
+  const subagentRequest = isSubagentPrompt(systemPrompt);
+  const model = subagentRequest ? SUBAGENT_MODEL : requestedModel;
   const affinitySource = promptText || [systemPrompt, firstUserMessage?.content || ''].filter(Boolean).join('\n\n');
   const normalizedPrefix = takeTokenPrefix(affinitySource, 256);
   const modelPrefix = model ? `${model}_` : '';
@@ -1601,6 +1835,7 @@ function extractRequestContext(body) {
 
   return {
     model,
+    requestedModel,
     promptText,
     systemPrompt,
     normalizedSystemPrompt,
@@ -1612,6 +1847,7 @@ function extractRequestContext(body) {
     prefixSignature,
     hasAffinity: Boolean(normalizedPrefix || normalizedSystemPrompt),
     canUseCache: Boolean(systemPrompt && exactHash),
+    subagentRequest,
   };
 }
 
@@ -1842,6 +2078,7 @@ server.get('/dashboard', async (request, reply) => {
 server.get('/api/stats', async (request, reply) => {
   let l1UsageBytes = 0;
   const gpuMetrics = await collectGPUMetrics();
+  await Promise.all(backends.map(backend => refreshBackendPrefillProgress(backend)));
   try {
     const files = await safeReaddir(L1_DIR);
     for (const f of files) {
@@ -1890,7 +2127,10 @@ server.get('/api/stats', async (request, reply) => {
         activeReq,
         taskId: slotActivity.taskId,
         phase: slotActivity.phase,
+        summary: slotActivity.summary,
         detail: slotActivity.detail,
+        updatedAt: slotActivity.updatedAt,
+        startedAt: slotActivity.startedAt,
         progress: slotActivity.progress,
         restoredCacheHash: slotActivity.restoredCacheHash,
         cacheStatus: slotActivity.cacheStatus,
@@ -1903,6 +2143,8 @@ server.get('/api/stats', async (request, reply) => {
   reply.send({
     queueLength: getTotalQueueLength(),
     l1UsageBytes,
+    l1EvictThresholdBytes: L1_EVICT_THRESHOLD,
+    l1EvictTargetBytes: L1_EVICT_TARGET,
     gpu: gpuMetrics,
     models: [...buildAggregatedModelRegistry().values()].map(entry => ({
       id: entry.id,
@@ -1919,6 +2161,12 @@ server.get('/api/stats', async (request, reply) => {
       url: backend.baseUrl,
       gpuGroup: backend.gpuGroup,
       healthy: backend.healthy,
+      routable: isBackendRoutable(backend),
+      degradedUntil: backend.degradedUntil,
+      failureStreak: backend.failureStreak,
+      lastFailureKind: backend.lastFailureKind,
+      requestFailures: backend.requestFailures,
+      restoreFailures: backend.restoreFailures,
       activity: getBackendActivitySnapshot(backend),
       queueLength: backend.slotQueue.length,
       activeRequests: backend.activeSlots.size,
@@ -2116,10 +2364,12 @@ server.post('/api/settings/reload', async (request, reply) => {
 
 server.post('/api/restart', async (request, reply) => {
   try {
-    // Close the HTTP server (stops accepting new connections)
-    await server.close();
-    // Let the supervisor (systemd/PM2) handle respawn
-    process.exit(0);
+    log('SERVER', 'Restart requested via Control Deck. Signaling graceful teardown...');
+    reply.send({ ok: true });
+    
+    // Instead of process.exit(0), trigger self-directed SIGTERM 
+    // to let your existing process event listeners kill worker nodes.
+    setImmediate(() => process.emit('SIGTERM'));
   } catch (err) {
     reply.status(500).send({ error: err.message });
   }
@@ -2198,6 +2448,7 @@ server.post('/v1/chat/completions', async (request, reply) => {
   const requestStartedAt = Date.now();
   let cacheStatus = 'BYPASS';
   let shouldSaveCache = false;
+  let skipCacheSaveReason = null;
   let streamedChunkCount = 0;
   let metricsCaptureStarted = false;
 
@@ -2269,20 +2520,32 @@ server.post('/v1/chat/completions', async (request, reply) => {
     log('DEDUP', `Waiting for in-flight cache creation for ${requestContext.exactHash.slice(0, 8)}`);
     try {
       await new Promise((resolve, reject) => {
+        // 1. Declare and define the resolver first so the reference is completely solid
+        const resolver = () => {
+          signal.removeEventListener('abort', onAbort);
+          resolve();
+        };
+
+        // 2. Define the abort loop which can now confidently target the pointer
         const onAbort = () => {
-          // Clean up entry on abort to prevent memory leak
-          inFlightMisses.delete(requestContext.exactHash);
+          const list = inFlightMisses.get(requestContext.exactHash);
+          if (list) {
+            const idx = list.indexOf(resolver); 
+            if (idx !== -1) {
+              list.splice(idx, 1);
+            }
+            if (list.length === 0) {
+              inFlightMisses.delete(requestContext.exactHash);
+            }
+          }
           const err = new Error('aborted');
           err.name = 'AbortError';
           reject(err);
         };
+
         if (signal.aborted) return onAbort();
         signal.addEventListener('abort', onAbort);
-
-        inFlightMisses.get(requestContext.exactHash).push(() => {
-          signal.removeEventListener('abort', onAbort);
-          resolve();
-        });
+        inFlightMisses.get(requestContext.exactHash).push(resolver);
       });
     } catch (err) {
       if (err.name === 'AbortError') return;
@@ -2292,14 +2555,28 @@ server.post('/v1/chat/completions', async (request, reply) => {
 
   const l1Exists = Boolean(filename && existsSync(l1Path));
   const l2Exists = Boolean(filename && existsSync(l2Path));
+  const effectiveBody = requestContext.model && requestContext.model !== body?.model
+    ? { ...body, model: requestContext.model }
+    : body;
   const routing = chooseBackendForRequest(requestContext);
   selectedBackend = routing.backend;
 
-  log('ROUTE', `backend=${selectedBackend.id} reason=${routing.reason} req=${reqId}`);
+  log(
+    'ROUTE',
+    `backend=${selectedBackend.id} reason=${routing.reason} req=${reqId}`
+      + (requestContext.subagentRequest
+        ? ` requestedModel=${requestContext.requestedModel || 'none'} effectiveModel=${requestContext.model}`
+        : '')
+  );
 
   try {
     assignedSlotId = await acquireSlotOnBackend(selectedBackend, reqId, signal, routing.preferredSlotId);
     observedSlotId = assignedSlotId;
+    const trackedSlot = selectedBackend.slotContextIndex.get(assignedSlotId);
+    // Revoke the previous residency claim before this request can mutate the slot.
+    // We keep a local snapshot only to validate whether this request can treat the slot
+    // as an exact hot hit; the authoritative index is restored only after clean success.
+    clearSlotContext(selectedBackend, assignedSlotId);
     updateActivity({
       phase: 'prefill',
       summary: 'Prefilling prompt',
@@ -2308,8 +2585,7 @@ server.post('/v1/chat/completions', async (request, reply) => {
       cacheStatus,
     });
 
-    let proxyBody = { ...body, id_slot: assignedSlotId };
-    const trackedSlot = selectedBackend.slotContextIndex.get(assignedSlotId);
+    let proxyBody = { ...effectiveBody, id_slot: assignedSlotId };
 
     if (requestContext.canUseCache && (l1Exists || l2Exists)) {
       markCacheBusy();
@@ -2352,7 +2628,12 @@ server.post('/v1/chat/completions', async (request, reply) => {
       }
 
       if (cacheReady) {
-        proxyBody = { ...body, messages: requestContext.userMessages, id_slot: assignedSlotId };
+        proxyBody = { ...effectiveBody, messages: requestContext.userMessages, id_slot: assignedSlotId };
+        
+        // RE-PRIME INDEX: Since we verified this slot actively holds valid warm cache data,
+        // restore its lookups immediately so concurrent in-flight requests can reuse it.
+        rememberSlotContext(selectedBackend, assignedSlotId, requestContext, 'hit');
+
         updateActivity({
           phase: 'prefill',
           summary: 'Prefilling prompt',
@@ -2388,6 +2669,11 @@ server.post('/v1/chat/completions', async (request, reply) => {
     const observeStreamChunk = chunk => {
       observeSlot(chunk, parsed => {
         recordObservedChatMetrics(parsed);
+        if (shouldSaveCache && !skipCacheSaveReason && payloadHasLengthFinishReason(parsed)) {
+          skipCacheSaveReason = 'finish_reason_length';
+          shouldSaveCache = false;
+          markCacheSaveSkipped(skipCacheSaveReason, requestContext.exactHash);
+        }
       });
       if (!metricsCaptureStarted && selectedBackend) {
         metricsCaptureStarted = true;
@@ -2409,6 +2695,31 @@ server.post('/v1/chat/completions', async (request, reply) => {
     const llamaRes = await fetchChatCompletion(selectedBackend, request.headers, proxyBody, signal);
     if (!llamaRes.ok) {
       const errText = await llamaRes.text().catch(() => '');
+      let parsedError = null;
+      try {
+        parsedError = errText ? JSON.parse(errText) : null;
+      } catch {
+        parsedError = null;
+      }
+
+      const classification = classifyContextOverflow(parsedError || errText, llamaRes.status);
+      if (classification.overflow) {
+        const skippedSave = shouldSaveCache;
+        skipCacheSaveReason = 'context_overflow';
+        shouldSaveCache = false;
+        markContextOverflow(
+          requestContext.exactHash,
+          `http_${llamaRes.status}`,
+          classification.message || errText.slice(0, 160),
+          skippedSave
+        );
+
+        const err = new Error(classification.message || `Request exceeds the available context size on backend ${selectedBackend.id}`);
+        err.statusCode = 400;
+        err.errorType = 'invalid_request_error';
+        throw err;
+      }
+
       logErr(`llama.cpp ${selectedBackend.id} returned ${llamaRes.status}: ${errText.slice(0, 500)}`);
       throw new Error(`llama.cpp ${selectedBackend.id} returned ${llamaRes.status}: ${errText.slice(0, 300)}`);
     }
@@ -2436,6 +2747,11 @@ server.post('/v1/chat/completions', async (request, reply) => {
       try {
         const parsed = JSON.parse(responseText);
         recordObservedChatMetrics(parsed);
+        if (shouldSaveCache && !skipCacheSaveReason && payloadHasLengthFinishReason(parsed)) {
+          skipCacheSaveReason = 'finish_reason_length';
+          shouldSaveCache = false;
+          markCacheSaveSkipped(skipCacheSaveReason, requestContext.exactHash);
+        }
         const slotId = parsed?.slot_id ?? parsed?.id_slot;
         if (Number.isInteger(slotId)) {
           observedSlotId = slotId;
@@ -2451,6 +2767,8 @@ server.post('/v1/chat/completions', async (request, reply) => {
 
     const effectiveSlotId = normalizeSlotId(observedSlotId, assignedSlotId, selectedBackend);
     if (requestContext.hasAffinity) {
+      // Re-advertise the slot only after the request completed without error. Doing this
+      // earlier would let a later overflow or abort leave behind a false hot-slot claim.
       rememberSlotContext(selectedBackend, effectiveSlotId, requestContext, cacheStatus === 'HIT' ? 'hit' : 'stream');
     }
 
@@ -2464,25 +2782,75 @@ server.post('/v1/chat/completions', async (request, reply) => {
           progress: null,
           tokens: streamedChunkCount,
         });
-        const saveResult = await saveKVCache(requestContext.exactHash, requestContext.model, selectedBackend, assignedSlotId);
-        if (saveResult) {
-          rememberSlotContext(selectedBackend, effectiveSlotId, requestContext, 'save');
-          const copyWithTimeout = (src, dst, timeoutMs = 30_000) => {
-            const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(), timeoutMs);
-            return copyFile(src, dst).finally(() => clearTimeout(timer));
-          };
 
-          copyWithTimeout(join(L1_DIR, `${requestContext.exactHash}.bin`), l2Path)
-            .then(() => {
-              log('SAVE', `${C.green}Persisted${C.reset}  →  L2 SSD`);
-            })
-            .catch(err => logWarn(`L2 persist failed: ${err.message}`));
+        // Proactive Defrag Cushions: Run an immediate check before saving if VRAM/L1 limits are close
+        await sweepL1Eviction();
+
+        // RACE OPTIMIZATION: If a copy of this exact hash is already in flight, drop out safely
+        if (inFlightDiskCopies.has(requestContext.exactHash)) {
+          log('SAVE', `Cache replication in-flight; concurrent L1/L2 save dropped safely`);
+        } else if (existsSync(l1Path) && existsSync(l2Path)) {
+          log('SAVE', `Cache already exists on L1 and L2; skip approved`);
+        } else {
+          const saveResult = await saveKVCache(requestContext.exactHash, requestContext.model, selectedBackend, assignedSlotId);
+          if (saveResult) {
+            rememberSlotContext(selectedBackend, effectiveSlotId, requestContext, 'save');
+
+            // FATIGUE OPTIMIZATION: If the target file is already warm on L2, do not burn drive lifespan re-writing it
+            if (existsSync(l2Path)) {
+              log('SAVE', `Cache preserved on L1; L2 SSD skip approved (Invariance Validated)`);
+            } else {
+              // RACE OPTIMIZATION: Handle concurrent block copying requests for identical hashes seamlessly
+              if (!inFlightDiskCopies.has(requestContext.exactHash)) {
+                const copyWithTimeout = (src, dst, timeoutMs = 45_000) => {
+                  const controller = new AbortController();
+                  const timer = setTimeout(() => controller.abort(), timeoutMs);
+                  return copyFile(src, dst).finally(() => clearTimeout(timer));
+                };
+
+                const copyPromise = copyWithTimeout(l1Path, l2Path)
+                  .then(() => {
+                    log('SAVE', `Successfully Persisted to L2 SSD Layer`);
+                  })
+                  .catch(err => logWarn(`Background replication aborted: ${err.message}`))
+                  .finally(() => {
+                    inFlightDiskCopies.delete(requestContext.exactHash);
+                  });
+
+                inFlightDiskCopies.set(requestContext.exactHash, copyPromise);
+              }
+            }
+          }
         }
       } catch (err) {
-        logWarn(`Save pipeline failed: ${err.message}`);
+        logWarn(`Save tracking pipe failed: ${err.message}`);
       }
+    } else if (skipCacheSaveReason && cacheStatus === 'MISS') {
+      updateActivity({
+        phase: 'idle',
+        summary: 'Cache save skipped',
+        detail: `Skipped KV persistence: ${skipCacheSaveReason}`,
+        cacheStatus,
+        progress: null,
+        tokens: streamedChunkCount,
+      });
     }
+    if (!signal.aborted && selectedBackend) {
+      markBackendRequestSuccess(selectedBackend);
+    }
+  } catch (err) {
+    if (selectedBackend && err.name !== 'AbortError' && !String(err.message || '').includes('aborted')) {
+      markBackendRequestFailure(selectedBackend, 'request', err);
+      const slotId = normalizeSlotId(observedSlotId, assignedSlotId, selectedBackend);
+      updateSlotActivity(selectedBackend, slotId, {
+        phase: 'error',
+        summary: 'Request failed',
+        detail: err.message,
+        progress: null,
+        cacheStatus,
+      });
+    }
+    throw err;
   } finally {
     if (selectedBackend && assignedSlotId !== null) {
       const slotId = normalizeSlotId(observedSlotId, assignedSlotId, selectedBackend);
