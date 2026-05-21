@@ -513,7 +513,13 @@ async function waitForBackendModelCondition(backend, modelId, predicate, actionL
   }
 
   const detail = lastError ? `, last refresh error: ${lastError.message}` : '';
-  throw new Error(`Timed out waiting for model ${normalizedModelId} on ${backend.id} to ${actionLabel} (last state=${lastState}${detail})`);
+  const err = new Error(`Timed out waiting for model ${normalizedModelId} on ${backend.id} to ${actionLabel} (last state=${lastState}${detail})`);
+  err.name = 'BackendModelTimeoutError';
+  err.backendId = backend.id;
+  err.modelId = normalizedModelId;
+  err.actionLabel = actionLabel;
+  err.lastState = lastState;
+  throw err;
 }
 
 function withBackendModelOperationLock(backend, operation) {
@@ -602,13 +608,20 @@ async function switchModelOnBackend(backend, modelId) {
     normalizedModelId,
     status => isBackendModelReady(status),
     'load'
-  );
+  ).catch(err => {
+    if (err.name === 'BackendModelTimeoutError' && err.lastState === 'loading') {
+      logWarn(`Model ${normalizedModelId} is still loading on ${backend.id} after ${Math.round(MODEL_OPERATION_TIMEOUT_MS / 1000)}s`);
+      return { value: 'loading' };
+    }
+    throw err;
+  });
 
   return {
     model: normalizedModelId,
     status: readyStatus?.value || 'loaded',
     unloadedModels,
     alreadyLoaded: false,
+    pending: readyStatus?.value === 'loading',
   };
 }
 
@@ -2229,11 +2242,16 @@ server.post('/models/load', async (request, reply) => {
       .then(result => ({ backendId: backend.id, ...result }))
   )));
 
-  const failed = results
-    .filter(result => result.status === 'rejected')
-    .map((result, index) => ({
-      backendId: candidateBackends[index].id,
-      message: result.reason?.message || String(result.reason),
+  const settledResults = results.map((result, index) => ({
+    backendId: candidateBackends[index].id,
+    result,
+  }));
+
+  const failed = settledResults
+    .filter(entry => entry.result.status === 'rejected')
+    .map(entry => ({
+      backendId: entry.backendId,
+      message: entry.result.reason?.message || String(entry.result.reason),
     }));
 
   if (failed.length > 0) {
@@ -2248,10 +2266,14 @@ server.post('/models/load', async (request, reply) => {
     return;
   }
 
-  reply.send({
-    success: true,
+  const backendResults = settledResults.map(entry => entry.result.value);
+  const pendingBackends = backendResults.filter(result => result.pending);
+
+  reply.status(pendingBackends.length > 0 ? 202 : 200).send({
+    success: pendingBackends.length === 0,
+    pending: pendingBackends.length > 0,
     model: modelId,
-    backends: results.map(result => result.value),
+    backends: backendResults,
   });
 });
 
