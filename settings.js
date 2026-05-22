@@ -43,9 +43,9 @@ function defaultSettings() {
     },
     health: {
       backendHealthcheckIntervalMs: 5_000,
-      backendHealthcheckTimeoutMs: 1_500,
+      backendHealthcheckTimeoutMs: 10_000,
       dedupWaitTimeoutMs: 15_000,
-      backendStartupGraceMs: 12_000,
+      backendStartupGraceMs: 30_000,
       backendAutoStart: true,
     },
     gc: {

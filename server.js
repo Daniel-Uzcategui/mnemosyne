@@ -1063,6 +1063,16 @@ async function timedFetch(url, timeoutMs, options = {}) {
 }
 
 async function checkBackendHealth(backend) {
+  // If the backend has active slots running, it is guaranteed to be alive and busy.
+  // We can skip the HTTP probe completely to avoid queueing requests that will time out,
+  // preventing HTTP aborts and subsequent slot cancel warnings in llama.cpp logs.
+  if (backend.activeSlots.size > 0) {
+    backend.healthy = true;
+    backend.lastError = null;
+    backend.lastCheckAt = Date.now();
+    return true;
+  }
+
   const probePaths = ['/health', '/metrics', '/'];
   const wasHealthy = backend.healthy;
   let lastError = 'unreachable';
@@ -2646,6 +2656,10 @@ server.post('/v1/chat/completions', async (request, reply) => {
             progress: 0,
           });
           log('WARN', `Restore failed (${err.message}) — falling back to full request`);
+          
+          // Clean up potentially corrupted cache files so they aren't tried again
+          if (l1Path) rm(l1Path, { force: true }).catch(() => {});
+          if (l2Path) rm(l2Path, { force: true }).catch(() => {});
         }
       }
 
